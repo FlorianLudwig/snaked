@@ -26,6 +26,7 @@ class TabbedEditorManager(snaked.core.manager.EditorManager):
 
         # set border width handling, see self.on_state_event for more details
         self.window.connect('window-state-event', self.on_state_event)
+        self.note = gtk.Notebook()
         self.note.set_border_width(0)
         self.note.set_show_border(False)
 
@@ -37,8 +38,6 @@ class TabbedEditorManager(snaked.core.manager.EditorManager):
         self.main_pane = gtk.VPaned()
         self.main_pane_position_set = False
         self.window.add(self.main_pane)
-
-        self.note = gtk.Notebook()
         self.note.set_show_tabs(self.snaked_conf['SHOW_TABS'])
         self.note.set_scrollable(True)
         self.note.set_property('tab-hborder', 10)
