@@ -185,10 +185,10 @@ class QuickOpenDialog(BuilderAware):
                     self.filelist.append(p)
 
                     if len(self.filelist) > 150:
-                        self.filelist_tree.columns_autosize()
+                        self.update_filelist()
                         return
+        self.update_filelist()
 
-        self.filelist_tree.columns_autosize()
 
     def fill_with_dirs(self, root='', top='', place=False):
         self.filelist.clear()
@@ -223,10 +223,15 @@ class QuickOpenDialog(BuilderAware):
             if name == place:
                 place_idx = i
             self.filelist.append((name, top, fpath, root))
-        self.filelist_tree.columns_autosize()
+        self.update_filelist()
 
         if place and len(self.filelist):
             self.filelist_tree.set_cursor((place_idx,))
+
+    def update_filelist(self):
+        if len(self.filelist_tree.get_model()):
+            self.filelist_tree.get_selection().select_path((0, ))
+        self.filelist_tree.columns_autosize()
 
     def on_search_entry_changed(self, *args):
         search = self.search_entry.get_text().strip()
@@ -235,6 +240,25 @@ class QuickOpenDialog(BuilderAware):
             idle(self.fill_filelist, search, self.current_search)
         else:
             idle(self.fill_with_dirs)
+
+    def on_search_entry_key(self, widget, event):
+        """arrow keys in searchfiled move selection of filelist"""
+        if event.keyval == gtk.keysyms.Up:
+            selection = self.filelist_tree.get_selection()
+            model, iter = selection.get_selected()
+            pos = model.get_path(iter)[0]
+            selection.select_path((max(pos-1, 0), ))
+            return True # do not further process this keypress
+        elif event.keyval == gtk.keysyms.Down:
+            selection = self.filelist_tree.get_selection()
+            contains = len(self.filelist_tree.get_model()) - 1
+            model, iter = selection.get_selected()
+            pos = model.get_path(iter)[0]
+            selection.select_path((min(pos+1, contains), ))
+            return True
+
+        return False
+
 
     def get_selected_file(self):
         (model, iter) = self.filelist_tree.get_selection().get_selected()
