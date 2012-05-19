@@ -5,9 +5,13 @@ import glib
 import pango
 import gtk
 
-from snaked.util import BuilderAware, join_to_file_dir
+from gtk.gdk import color_parse
 
-import pytest_launcher
+from uxie.utils import join_to_file_dir
+from uxie.misc import BuilderAware
+
+from . import pytest_launcher
+from .utils import get_executable
 
 class Escape(object): pass
 
@@ -25,6 +29,8 @@ class TestRunner(BuilderAware):
         self.buffer_place.add(self.view)
         self.view.show()
 
+        self.original_progress_color = self.progress.get_style().bg[gtk.STATE_SELECTED]
+
         self.editor_ref = None
         self.timer_id = None
         self.test_proc = None
@@ -33,7 +39,6 @@ class TestRunner(BuilderAware):
         self.nodes_traces = {}
         self.nodes_buffer_positions = {}
         self.panel.hide()
-        self.escape = None
 
     def collect(self, conn):
         while conn.poll():
@@ -52,7 +57,7 @@ class TestRunner(BuilderAware):
 
         return self.test_proc.poll() is None
 
-    def run(self, editor, matches='', files=[]):
+    def run(self, editor, project_root, matches='', files=[]):
         self.editor_ref = weakref.ref(editor)
         self.stop_running_test()
 
@@ -69,22 +74,20 @@ class TestRunner(BuilderAware):
         self.prevent_scroll = False
         self.buffer.delete(*self.buffer.get_bounds())
         self.buffer.node = None
+        self.progress.modify_bg(gtk.STATE_SELECTED, self.original_progress_color)
         self.progress.set_text('Running tests')
         self.stop_run.show()
         self.trace_buttons.hide()
 
-        proc, conn = pytest_launcher.run_test(editor.project_root, matches, files)
+        executable = get_executable(editor.conf)
+        env = editor.conf['PYTHON_EXECUTABLE_ENV']
+
+        proc, conn = pytest_launcher.run_test(project_root, executable, matches, files, env=env)
         self.test_proc = proc
         self.timer_id = glib.timeout_add(100, self.collect, conn)
 
     def show(self):
-        self.editor_ref().popup_widget(self.panel)
-
-    def hide(self, editor=None, *args):
-        self.escape = None
-        self.panel.hide()
-        if editor:
-            editor.view.grab_focus()
+        self.editor_ref().window.popup_panel(self.panel)
 
     def find_common_parent(self, nodes):
         if not nodes:
@@ -193,6 +196,8 @@ class TestRunner(BuilderAware):
         testname = self.tests.get_value(iter, 0)
         self.tests.set(iter, 0, u'\u2718 '.encode('utf8') + testname, 1, pango.WEIGHT_BOLD)
 
+        self.progress.modify_bg(gtk.STATE_SELECTED, color_parse('#7d2749'))
+
         if self.failed_tests_count == 1:
             self.tests_view.set_cursor(self.tests.get_path(iter))
             self.show()
@@ -216,6 +221,8 @@ class TestRunner(BuilderAware):
 
         if self.failed_tests_count:
             text.append('%d failed.' % self.failed_tests_count)
+        else:
+            self.progress.modify_bg(gtk.STATE_SELECTED, color_parse('#277d49'))
 
         self.progress.set_text(' '.join(text))
         self.progress_adj.set_value(self.tests_count)
@@ -252,9 +259,8 @@ class TestRunner(BuilderAware):
             self.buffer.set_text('')
             self.buffer.node = None
 
-    def on_popup(self, widget, editor):
-        self.escape = Escape()
-        editor.push_escape(self.hide, self.escape)
+    def on_activate(self, widget):
+        self.tests_view.grab_focus()
 
     def on_tests_view_row_activated(self, view, path, *args):
         iter = self.tests.get_iter(path)
@@ -275,7 +281,7 @@ class TestRunner(BuilderAware):
         if not filename.startswith('/'):
             filename = os.path.join(self.test_dir, filename)
 
-        e = self.editor_ref().open_file(filename, line - 1)
+        e = self.editor_ref().window.open_or_activate(filename, line)
         e.view.grab_focus()
 
     def on_stop_run_activate(self, button):

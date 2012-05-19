@@ -2,8 +2,10 @@ import weakref
 
 import gtksourceview2
 
-from snaked.util import BuilderAware, join_to_file_dir, idle
-from snaked.core import shortcuts
+from uxie.utils import join_to_file_dir, idle
+from uxie.misc import BuilderAware
+from uxie.actions import Activator
+
 import snaked.core.prefs as prefs
 
 on_dialog_created_hooks = []
@@ -13,8 +15,10 @@ on_pref_refresh_hooks = []
 class PreferencesDialog(BuilderAware):
     def __init__(self, prefs):
         BuilderAware.__init__(self, join_to_file_dir(__file__, 'editor_prefs.glade'))
-        self.activator = shortcuts.ShortcutActivator(self.window)
-        self.activator.bind('Escape', self.hide)
+
+        from snaked.core.manager import keymap
+        self.activator = keymap.get_activator(self.window)
+        self.activator.bind('any', 'escape', None, self.hide)
 
         self.prefs = prefs
         self.original_prefs = prefs.copy()
@@ -44,10 +48,16 @@ class PreferencesDialog(BuilderAware):
         for h in on_dialog_created_hooks:
             h(self)
 
-    def show(self, editor):
-        self.editor = weakref.ref(editor)
-        editor.request_transient_for.emit(self.window)
-        self.select_lang(editor.lang)
+    def show(self, window):
+        self.pwindow = weakref.ref(window)
+        self.window.set_transient_for(window)
+
+        editor = window.get_editor_context()
+        if editor:
+            self.select_lang(editor.lang)
+        else:
+            self.select_lang(default)
+
         self.refresh_lang_settings()
         self.window.present()
 
@@ -114,7 +124,7 @@ class PreferencesDialog(BuilderAware):
 
     def hide(self):
         self.save_settings()
-        self.editor().message('Editor settings saved')
+        self.pwindow().emessage('Editor settings saved')
         self.window.destroy()
 
     def save_settings(self):
@@ -123,6 +133,23 @@ class PreferencesDialog(BuilderAware):
     def on_delete_event(self, *args):
         idle(self.hide)
         return True
+
+    def update_editor_settings(self):
+        manager = self.pwindow().manager
+        editor = self.pwindow().get_editor_context()
+        buf = editor.buffer if editor else None
+
+        if editor:
+            manager.set_buffer_prefs(buf, buf.uri, buf.lang)
+            editor.update_view_preferences()
+
+        for b in manager.buffers:
+            if b is not buf:
+                idle(manager.set_buffer_prefs, b, b.uri, b.lang)
+
+        for e in manager.get_editors():
+            if e is not editor:
+                idle(e.update_view_preferences)
 
     def update_pref_value(self, lang_id, name, value):
         current_value = self.get_lang_prefs(lang_id)[name]
@@ -136,7 +163,7 @@ class PreferencesDialog(BuilderAware):
             else:
                 self.prefs.setdefault(lang_id, {})[name] = value
 
-            self.editor().settings_changed.emit()
+            self.update_editor_settings()
 
     def on_style_cb_changed(self, *args):
         (style_id,) = self.styles[self.style_cb.get_active()]
@@ -159,4 +186,4 @@ class PreferencesDialog(BuilderAware):
             pass
 
         self.refresh_lang_settings()
-        self.editor().settings_changed.emit()
+        self.update_editor_settings()

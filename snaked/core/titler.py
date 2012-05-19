@@ -6,15 +6,13 @@ fsm_cache = {}
 title_contexts = {}
 wtitle_contexts = {}
 
-def init(manager):
-    """:type manager:snaked.core.plugins.ShortcutsHolder"""
-    manager.add_context('title', on_set_title_context)
-    manager.add_context('wtitle', on_set_wtitle_context)
+def init(injector):
+    from .prefs import add_option
 
-    manager.add_global_option('TAB_TITLE_FORMAT', '%modified{%pypkg|%name2}{%writeable|[ro]}',
+    add_option('TAB_TITLE_FORMAT', '%modified{%pypkg|%name2}{%writeable|[ro]}',
         'Default format string for tab titles')
 
-    manager.add_global_option('WINDOW_TITLE_FORMAT',
+    add_option('WINDOW_TITLE_FORMAT',
         '%modified{%project|NOP}:{%path|%fullpath}{%writeable|[ro]}',
         'Default format string for window title')
 
@@ -26,36 +24,29 @@ def init(manager):
     add_title_handler('writeable', writable_handler)
     add_title_handler('modified', modified_handler)
 
+    injector.on_ready('editor-with-new-buffer-created', editor_created)
+
 def editor_created(editor):
     editor.connect('get-title', on_editor_get_title)
     editor.connect('get-window-title', on_editor_get_window_title)
 
-def get_format_from_contexts(editor, contexts):
-    root = editor.project_root
-    if root in contexts:
-        for fstr, matcher in contexts[root].items():
-            if matcher.match(editor.uri):
-                return fstr
+def get_format_from_context(editor, context):
+    return editor.window.manager.get_context_manager(
+        editor.project_root).get_first(context, editor.uri)
 
 def on_editor_get_title(editor):
-    format = get_format_from_contexts(editor, title_contexts)
+    format = get_format_from_context(editor, 'title')
     if not format:
-        format = editor.snaked_conf['TAB_TITLE_FORMAT']
+        format = editor.conf['TAB_TITLE_FORMAT']
 
     return get_title(editor, format)
 
 def on_editor_get_window_title(editor):
-    format = get_format_from_contexts(editor, wtitle_contexts)
+    format = get_format_from_context(editor, 'wtitle')
     if not format:
-        format = editor.snaked_conf['WINDOW_TITLE_FORMAT']
+        format = editor.conf['WINDOW_TITLE_FORMAT']
 
     return get_title(editor, format)
-
-def on_set_title_context(root, contexts):
-    title_contexts[root] = contexts
-
-def on_set_wtitle_context(root, contexts):
-    wtitle_contexts[root] = contexts
 
 def add_title_handler(name, callback):
     title_handlers[name] = callback

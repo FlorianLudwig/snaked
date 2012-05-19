@@ -1,51 +1,76 @@
 author = 'Anton Bobrov<bobrov@vl.ru>'
 name = 'Python support'
-desc = 'Autocompletion, definitions navigation and smart ident'
-
-langs = ['python']
+desc = 'Autocompletion, navigation and smart ident'
 
 import weakref
+import os.path
+
+from snaked.core.problems import mark_exact_problems, \
+    attach_to_editor as attach_problem_tooltips_to_editor
 
 handlers = weakref.WeakKeyDictionary()
 outline_dialog = None
 test_runner = []
 last_run_test = []
 
-def init(manager):
-    manager.add_shortcut('python-goto-definition', 'F3', 'Python',
-        'Navigates to python definition', goto_definition)
+def is_python_editor(editor):
+    return editor.lang == 'python'
 
-    manager.add_shortcut('python-outline', '<ctrl>o', 'Python',
-        'Opens outline dialog', open_outline)
+def init(injector):
+    injector.add_context('python-editor', 'editor-active',
+        lambda e: e if is_python_editor(e) else None)
 
-    manager.add_shortcut('python-calltip', '<ctrl>Return', 'Python',
-        'Shows calltips', show_calltips)
+    injector.bind('python-editor', 'goto-definition', '_Python#70/Goto _defenition', goto_definition)
+    injector.bind('python-editor', 'show-outline', 'Python/Show _outline', open_outline)
 
-    manager.add_shortcut('run-test', '<ctrl>F10', 'Tests', 'Run test in cursor scope', run_test)
-    manager.add_shortcut('run-all-tests', '<ctrl><shift>F10', 'Tests',
-        'Run all project tests', run_all_tests)
-    manager.add_shortcut('rerun-test', '<shift><alt>X', 'Tests', 'Rerun last test suite', rerun_test)
-    manager.add_shortcut('toggle-test-panel', '<alt>1', 'Window',
-        'Toggle test panel', toggle_test_panel)
+    injector.bind('python-editor', 'show-calltip', 'Python/Show _calltip', show_calltips)
 
-    manager.add_global_option('PYTHON_SPYPKG_HANDLER_MAX_CHARS', 25,
-        'Maximum allowed python package title length')
+    injector.bind_dynamic('python-editor', 'select-interpreter', 'Python/_Executable/executables',
+        generate_python_executable_menu, resolve_python_executable_menu_entry, True)
 
-    manager.add_title_handler('pypkg', pypkg_handler)
-    manager.add_title_handler('spypkg', spypkg_handler)
+    injector.bind('editor', 'run-test', 'Python/_Tests/_Run test in cursor scope', run_test)
+    injector.bind('editor', 'run-all-tests', 'Python/Tests/Run _all tests', run_all_tests)
+    injector.bind('editor', 'rerun-test', 'Python/Tests/Rerun last test', rerun_test)
+    injector.bind('editor', 'toggle-test-panel', 'View/Toggle _test panel', toggle_test_panel)
 
-    from snaked.core.prefs import register_dialog
-    register_dialog('Rope hints', edit_rope_hints, 'rope', 'hints')
-    register_dialog('Rope config', edit_rope_config, 'rope', 'config')
+    from snaked.core.prefs import add_option, add_internal_option
 
+    add_internal_option('PYTHON_EXECUTABLE', 'default')
+    add_option('PYTHON_EXECUTABLES', dict,
+        'Path to python executables. Used by test runner and completion framework')
+    add_option('PYTHON_EXECUTABLE_ENV', dict,
+        'Python interpreter environment. Used by test runner and completion framework')
+    add_option('PYTHON_SUPP_CONFIG', dict, 'Config for supplement')
+
+    add_option('PYTHON_SPYPKG_HANDLER_MAX_CHARS', 25, 'Maximum allowed python package title length')
+
+    add_option('PYTHON_LINT_ON_FILE_LOAD', False, 'Run lint check on file load')
+
+    from snaked.core.titler import add_title_handler
+    add_title_handler('pypkg', pypkg_handler)
+    add_title_handler('spypkg', spypkg_handler)
+
+    injector.on_ready('editor-with-new-buffer-created', editor_created)
+    injector.on_ready('editor-with-new-buffer', editor_opened)
+    injector.on_ready('manager', start_supplement)
+    injector.on_done('last-buffer-editor', editor_closed)
+    injector.on_done('manager', quit)
 
 def editor_created(editor):
-    editor.connect('get-project-larva', on_editor_get_project_larva)
+    if is_python_editor(editor):
+        editor.connect('get-project-larva', on_editor_get_project_larva)
 
 def editor_opened(editor):
-    from plugin import Plugin
-    h = Plugin(editor)
-    handlers[editor] = h
+    if is_python_editor(editor):
+        from plugin import Plugin
+        h = Plugin(editor)
+        handlers[editor] = h
+
+        editor.connect('file-saved', add_lint_job)
+        attach_problem_tooltips_to_editor(editor)
+        if editor.conf['PYTHON_LINT_ON_FILE_LOAD'] \
+                and editor.uri and os.path.exists(editor.uri):
+            add_lint_job(editor)
 
 def editor_closed(editor):
     try:
@@ -53,15 +78,34 @@ def editor_closed(editor):
     except KeyError:
         pass
 
-def quit():
+def add_lint_job(editor):
+    from threading import Thread
+    from uxie.utils import idle
+
+    def job():
+        try:
+            plugin = handlers[editor]
+        except KeyError:
+            return
+
+        try:
+            problems = plugin.env.lint(plugin.project_path, editor.utext, editor.uri)
+        except Exception, e:
+            idle(editor.message, str(e), 'error')
+            return
+
+        idle(mark_exact_problems, editor, 'supp-lint', problems)
+
+    Thread(target=job).start()
+
+def quit(manager):
     global outline_dialog
     if outline_dialog:
         outline_dialog.window.destroy()
         del outline_dialog
 
-    import plugin
-    for v in plugin.project_managers.values():
-        v.close()
+    from .utils import close_envs
+    close_envs()
 
 def goto_definition(editor):
     try:
@@ -98,7 +142,7 @@ def get_package_root(module_path):
     return module_path, '.'.join(reversed(packages))
 
 def on_editor_get_project_larva(editor):
-    from snaked.util import join_to_file_dir
+    from uxie.utils import join_to_file_dir
     import os.path
 
     if os.path.exists(join_to_file_dir(editor.uri, '__init__.py')):
@@ -141,7 +185,7 @@ def spypkg_handler(editor):
 
     import re
 
-    max_chars_in_title = editor.snaked_conf['PYTHON_SPYPKG_HANDLER_MAX_CHARS']
+    max_chars_in_title = editor.conf['PYTHON_SPYPKG_HANDLER_MAX_CHARS']
 
     parts = package.split('.')
     if parts < 3 or len(package) <= max_chars_in_title:
@@ -167,48 +211,6 @@ def open_outline(editor):
 
     outline_dialog.show(editor)
 
-def edit_rope_hints(editor):
-    import shutil
-    from os.path import join, exists, dirname
-    from snaked.util import make_missing_dirs
-
-    if not editor.project_root:
-        editor.message('Can not determine current project.\n'
-            'Are you editing read-only file?\n'
-            'Also check existence of .snaked_project directory', 8000)
-        return
-
-    ropehints = join(editor.project_root, '.ropeproject', 'ropehints.py')
-    if not exists(ropehints):
-        make_missing_dirs(ropehints)
-        shutil.copy(join(dirname(__file__), 'ropehints_tpl.py'), ropehints)
-
-    editor.open_file(ropehints)
-
-def edit_rope_config(editor):
-    from os.path import join, exists
-
-    if not editor.project_root:
-        editor.message('Can not determine current project.\n'
-            'Are you editing read-only file?\n'
-            'Also check existence of .snaked_project directory', 8000)
-        return
-
-    ropeconfig = join(editor.project_root, '.ropeproject', 'config.py')
-
-    if exists(ropeconfig):
-        editor.open_file(ropeconfig)
-    else:
-        if editor in handlers:
-            handlers[editor].project_manager
-
-        if exists(ropeconfig):
-            editor.open_file(ropeconfig)
-        else:
-            editor.message('There is no existing rope config.\n'
-                'Are you sure this is python project?\n'
-                'Try to open any python file', 8000)
-
 def get_pytest_runner(editor):
     """:rtype: snaked.plugins.python.pytest_runner.TestRunner()"""
     try:
@@ -219,54 +221,73 @@ def get_pytest_runner(editor):
     from pytest_runner import TestRunner
     test_runner.append(TestRunner())
 
-    editor.add_widget_to_stack(test_runner[0].panel, test_runner[0].on_popup)
+    editor.window.append_panel(test_runner[0].panel)\
+        .on_activate(test_runner[0].on_activate)
+
     return test_runner[0]
 
 def toggle_test_panel(editor):
     runner = get_pytest_runner(editor)
-    if runner.panel.get_focus_child():
-        runner.hide()
-        editor.view.grab_focus()
-    else:
-        runner.editor_ref = weakref.ref(editor)
-        editor.popup_widget(runner.panel)
-        runner.tests_view.grab_focus()
+    editor.window.popup_panel(runner.panel)
 
 def pytest_available(editor):
     try:
         import pytest
     except ImportError:
-        editor.message('You need installed pytest\nsudo pip install pytest')
+        editor.message('You need installed pytest\nsudo pip install pytest', 'warn')
         return False
 
     return True
 
-def set_last_run_test(func_name, filenames):
+def set_last_run_test(*args):
     if last_run_test:
-        last_run_test[0] = func_name, filenames
+        last_run_test[0] = args
     else:
-        last_run_test.append((func_name, filenames))
+        last_run_test.append(args)
 
 def run_all_tests(editor):
     if pytest_available(editor):
-        editor.message('Collecting tests...')
-        set_last_run_test('', [])
-        get_pytest_runner(editor).run(editor)
+        editor.message('Collecting tests...', 'info')
+        set_last_run_test(editor.project_root, '', [])
+        get_pytest_runner(editor).run(editor, editor.project_root)
 
 def run_test(editor):
     if pytest_available(editor):
         filename, func_name = handlers[editor].get_scope()
         if filename:
-            editor.message('Collecting tests...')
-            set_last_run_test(func_name, [filename])
-            get_pytest_runner(editor).run(editor, func_name, [filename])
+            editor.message('Collecting tests...', 'info')
+            set_last_run_test(editor.project_root, func_name, [filename])
+            get_pytest_runner(editor).run(editor, editor.project_root, func_name, [filename])
         else:
-            editor.message('Test scope can not be defined')
+            editor.message('Test scope can not be defined', 'warn')
 
 def rerun_test(editor):
     if pytest_available(editor):
         if last_run_test:
-            editor.message('Collecting tests...')
+            editor.message('Collecting tests...', 'info')
             get_pytest_runner(editor).run(editor, *last_run_test[0])
         else:
-            editor.message('You do not run any test yet')
+            editor.message('You did not run any test yet', 'warn')
+
+def set_python_executable(editor, name):
+    from .utils import get_executable, get_env
+    editor.conf['PYTHON_EXECUTABLE'] = name
+    editor.message('Python executable was set to:\n' + get_executable(editor.conf))
+    get_env(editor.conf).prepare()
+
+def generate_python_executable_menu(editor):
+    from .utils import get_virtualenvwrapper_executables
+    executables = set(('default', 'python2', 'python3'))\
+        .union(get_virtualenvwrapper_executables())\
+        .union(editor.conf['PYTHON_EXECUTABLES'])
+
+    for t in sorted(executables):
+        yield t == editor.conf['PYTHON_EXECUTABLE'], t, t, (set_python_executable, (editor, t))
+
+def resolve_python_executable_menu_entry(editor, entry_id):
+    return entry_id == editor.conf['PYTHON_EXECUTABLE'], set_python_executable,\
+        (editor, entry_id), entry_id
+
+def start_supplement(manager):
+    from .utils import get_env
+    get_env(manager.conf).prepare()

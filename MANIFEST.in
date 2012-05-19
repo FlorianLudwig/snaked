@@ -5,3 +5,5 @@ recursive-include snaked *.lang
 include README.rst
 include LICENSE
 include CHANGES
+include snaked/plugins/python/launcher/pt.py
+include completion/bash/snaked

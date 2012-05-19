@@ -1,55 +1,15 @@
-import os
+import os.path, sys
 
-import weakref
 import gtk
-import gio
+from uxie.utils import idle
 
-from snaked.signals import connect_external, connect_all, weak_connect
-from snaked.util import idle, lazy_property
+from snaked.util import lazy_property
+from snaked.signals import connect_external, connect_all
+from snaked.core.completer import add_completion_provider, attach_completer
 
-from .ropehints import CompositeHintProvider
+from .utils import get_env
 
-project_managers = weakref.WeakValueDictionary()
-
-class RopeProjectManager(object):
-    def __init__(self, project):
-        """:type project: rope.base.project.Project()"""
-        self.project = project
-        self.hints_monitor = None
-
-        if project.ropefolder:
-            self.hints_filename = os.path.join(project.ropefolder.real_path, 'ropehints.py')
-            self.hints_monitor = gio.File(self.hints_filename).monitor_file()
-            weak_connect(self.hints_monitor, 'changed', self, 'on_hints_file_changed')
-
-            self.refresh_hints()
-
-    def refresh_hints(self):
-        self.project.pycore.module_cache.forget_all_data()
-        self.project.pycore.hintdb = CompositeHintProvider(self.project)
-
-        if self.hints_filename and os.path.exists(self.hints_filename):
-            namespace = {}
-            execfile(self.hints_filename, namespace)
-            if 'init' in namespace:
-                try:
-                    namespace['init'](self.project.pycore.hintdb)
-                except:
-                    import traceback
-                    traceback.print_exc()
-
-    def on_hints_file_changed(self, filemonitor, file, other_file, event):
-        if event in (gio.FILE_MONITOR_EVENT_CHANGES_DONE_HINT, gio.FILE_MONITOR_EVENT_CREATED):
-            self.refresh_hints()
-
-    def close(self):
-        if self.hints_monitor:
-            self.hints_monitor.cancel()
-            self.hints_monitor = None
-        self.project.close()
-
-    def __del__(self):
-        self.close()
+configured_projects = {}
 
 class Plugin(object):
     def __init__(self, editor):
@@ -59,59 +19,37 @@ class Plugin(object):
 
     def init_completion(self):
         provider = self.completion_provider
-        completion = self.editor.view.get_completion()
-        completion.add_provider(provider)
+
+        if not hasattr(self.editor.buffer, 'python_completion_added'):
+            add_completion_provider(self.editor.buffer, provider, 100)
+            self.editor.buffer.python_completion_added = True
+
+        attach_completer(self.editor.view)
+
+    @property
+    def env(self):
+        return get_env(self.editor.conf)
 
     @lazy_property
-    def project_manager(self):
+    def project_path(self):
         root = getattr(self.editor, 'ropeproject_root', self.editor.project_root)
-        try:
-            return project_managers[root]
-        except KeyError:
-            pass
-
-        from rope.base.project import Project, NoProject
-        from rope.base.fscommands import FileSystemCommands
 
         if not root:
-            self.editor.message('Rope warning: there is no project. Assist was degraded')
-            project = NoProject()
-            project.validate = lambda *args: None
-            project.root = None
-        else:
-            if os.access(root, os.W_OK):
-                kwargs = {}
-            else:
-                kwargs = dict(ropefolder=None)
+            root = os.path.dirname(self.editor.uri)
 
-            project = Project(root, fscommands=FileSystemCommands(), **kwargs)
+        if root not in configured_projects:
+            conf = self.editor.conf['PYTHON_SUPP_CONFIG']
+            if conf:
+                self.env.configure_project(root, conf)
 
-        project.snaked_project_root = root
-        pm = RopeProjectManager(project)
-        if root:
-            project_managers[root] = pm
+            configured_projects[root] = True
 
-        return pm
+        return root
 
     @lazy_property
     def completion_provider(self):
         import complete
         return complete.RopeCompletionProvider(self)
-
-    def get_rope_resource(self, project, uri=None):
-        from rope.base import libutils, exceptions
-        uri = uri or self.editor.uri
-
-        if not hasattr(project, 'address'):
-            return project.get_file(uri)
-        else:
-            try:
-                return libutils.path_to_resource(project, uri)
-            except exceptions.ResourceNotFoundError:
-                from rope.base.project import NoProject
-                resource = NoProject().get_file(uri)
-                resource.read = lambda: ''
-                return resource
 
     def get_source_and_offset(self):
         offset = self.editor.cursor.get_offset()
@@ -122,76 +60,28 @@ class Plugin(object):
 
         return source, offset
 
-    def get_fuzzy_location(self, project, source, offset):
-        from rope.base import worder, exceptions
-
-        word_finder = worder.Worder(source, True)
-        expression = word_finder.get_primary_at(offset)
-        expression = expression.replace('\\\n', ' ').replace('\n', ' ')
-
-        names = expression.split('.')
-        pyname = None
-        try:
-            obj = project.pycore.get_module(names[0])
-            for n in names[1:]:
-                pyname = obj[n]
-                obj = pyname.get_object()
-        except (exceptions.ModuleNotFoundError, exceptions.AttributeNotFoundError):
-            return None, None
-
-        if not pyname:
-            try:
-                resource = obj._get_init_dot_py()
-            except AttributeError:
-                resource = obj.get_resource()
-
-            if not resource:
-                return None, None
-            else:
-                return resource, 1
-        else:
-            resource, line = pyname.get_definition_location()
-            if hasattr(resource, 'resource'):
-                resource = resource.resource
-
-        return resource, line
-
     def goto_definition(self):
-        project = self.project_manager.project
-
-        project.validate()
-
-        current_resource = self.get_rope_resource(project)
-
-        from rope.contrib import codeassist
-
         source, offset = self.get_source_and_offset()
         try:
-            resource, line = codeassist.get_definition_location(
-                project, source, offset,
-                resource=current_resource, maxfixes=3)
+            line, fname = self.env.get_location(self.project_path, source, offset, self.editor.uri)
         except Exception, e:
             import traceback
             traceback.print_exc()
-            self.editor.message(str(e), 5000)
+            self.editor.message(str(e), 'error', 5000)
             return
 
-        if resource is None and line is None:
-            resource, line = self.get_fuzzy_location(project, source, offset)
+        if fname == self.editor.uri:
+            fname = None
 
-        if resource and resource.real_path == current_resource.real_path:
-            resource = None
-
-        if resource:
-            uri = resource.real_path
-            editor = self.editor.open_file(uri, line - 1)
-            editor.ropeproject_root = project.snaked_project_root
+        if fname:
+            editor = self.editor.window.open_or_activate(fname, line - 1)
+            editor.supplement_project_root = self.project_path
         else:
             if line:
                 self.editor.add_spot()
                 self.editor.goto_line(line)
             else:
-                self.editor.message("Unknown definition")
+                self.editor.message("Unknown definition", 'warn')
 
     @connect_external('view', 'key-press-event')
     def on_textview_key_press_event(self, sender, event):
@@ -258,65 +148,29 @@ class Plugin(object):
         return True
 
     def show_calltips(self):
-        project = self.project_manager.project
-        project.validate()
-
-        current_resource = self.get_rope_resource(project)
-
-        from rope.contrib import codeassist
-        from snaked.util.pairs_parser import get_brackets
-
         source, offset = self.get_source_and_offset()
-
-        # make foo.bar.baz( equivalent to foo.bar.baz
-        if source[offset-1] in '(.':
-            offset -= 1
-
-        brackets = get_brackets(source, offset)
-        if brackets:
-            br, spos, epos = brackets
-            if br == '(':
-                offset = spos - 1
-
         try:
-            doc = codeassist.get_doc(project, source, offset, resource=current_resource, maxfixes=3)
+            result = self.env.get_docstring(self.project_path, source, offset, self.editor.uri)
         except Exception, e:
             import traceback
             traceback.print_exc()
-            self.editor.message(str(e), 5000)
+            self.editor.message(str(e), 'error', 5000)
             return
 
-        if doc:
-            self.editor.message(doc.strip(), 20000)
+        if not result:
+            self.editor.message("Can't get docstring", 'warn')
+            return
+
+        sig, docstring = result
+        if sig:
+            docstring = sig + '\n\n' + ( docstring if docstring is not None else '' )
+
+        if docstring:
+            self.editor.message(docstring, 'info', 20000)
         else:
-            self.editor.message('Info not found')
+            self.editor.message('Info not found', 'warn', 3000)
 
     def get_scope(self):
-        project = self.project_manager.project
-        project.validate()
-
-        resource = self.get_rope_resource(project)
-        source, offset = self.get_source_and_offset()
-
-        module = self.project_manager.project.pycore.get_string_module(source, resource, True)
-        scope = module.get_scope().get_inner_scope_for_offset(offset)
-
-        return self.get_file_and_scope(scope)
-
-    def get_file_and_scope(self, scope):
-        from rope.base.pyobjectsdef import PyModule, PyPackage
-
-        names = []
-        while scope:
-            obj = scope.pyobject
-            if isinstance(obj, (PyModule, PyPackage)):
-                if obj.resource:
-                    return obj.resource.path, '.'.join(names)
-                else:
-                    return None, None
-            else:
-                names.append(obj.get_name())
-
-            scope = scope.parent
-
-        return None, None
+        source, _ = self.get_source_and_offset()
+        return self.editor.uri, self.env.get_scope(self.project_path,
+            source, self.editor.cursor.get_line() + 1, self.editor.uri, False)

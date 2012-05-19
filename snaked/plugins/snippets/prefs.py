@@ -1,7 +1,9 @@
 import weakref
 
-from snaked.util import BuilderAware, join_to_file_dir, idle, set_activate_the_one_item
-from snaked.util import make_missing_dirs, join_to_settings_dir
+from uxie.utils import idle, join_to_file_dir, make_missing_dirs, join_to_settings_dir
+from uxie.misc import BuilderAware
+
+from snaked.util import set_activate_the_one_item
 
 def on_snippet_saved(editor, ctx):
     from . import existing_snippet_contexts, load_snippets_for
@@ -18,8 +20,8 @@ class PreferencesDialog(BuilderAware):
     def __init__(self, existing_snippets):
         BuilderAware.__init__(self, join_to_file_dir(__file__, 'prefs.glade'))
 
-        from snaked.core.shortcuts import ShortcutActivator
-        self.activator = ShortcutActivator(self.window)
+        from snaked.core.manager import keymap
+        self.activator = keymap.get_activator(self.window)
         self.activator.bind('Escape', self.hide)
         self.activator.bind('<alt>s', self.focus_search)
         self.existing_snippets = existing_snippets
@@ -60,7 +62,7 @@ class PreferencesDialog(BuilderAware):
         self.search_entry.grab_focus()
 
     def edit_context(self, ctx):
-        user_snippet_filename = join_to_settings_dir('snippets', ctx + '.snippets')
+        user_snippet_filename = join_to_settings_dir('snaked', 'snippets', ctx + '.snippets')
         if ctx in self.existing_snippets and \
                 self.existing_snippets[ctx] != user_snippet_filename:
 

@@ -1,22 +1,20 @@
 import os.path
-import time
-
 import weakref
 
 import gtk
 import gtksourceview2
 
-from ..util import save_file, idle, get_project_root, single_ref
-from ..signals import SignalManager, Signal, connect_all, connect_external
+from uxie.utils import idle
+
+from .prefs import add_option, update_view_preferences
+from ..util import save_file, get_project_root
+from ..signals import SignalManager, Signal, connect_all, connect_external, weak_connect
+
+add_option('DISABLE_LEFT_CLICK', False, 'Disable left mouse button handling in editor view')
 
 class Editor(SignalManager):
-    add_spot_request = Signal()
-
     before_close = Signal()
     before_file_save = Signal(return_type=bool) # Handlers can return True to prevent file saving
-
-    change_title = Signal(str)
-    editor_closed = Signal()
 
     file_loaded = Signal()
     file_saved = Signal()
@@ -26,36 +24,22 @@ class Editor(SignalManager):
     get_title = Signal(return_type=str)
     get_window_title = Signal(return_type=str)
 
-    plugins_changed = Signal()
-    push_escape_callback = Signal(object, object)
-
-    request_close = Signal()
-    request_to_open_file = Signal(str, object, object, return_type=object)
-    request_transient_for = Signal(object)
-
-    settings_changed = Signal()
-    stack_add_request = Signal(object, object)
-    stack_popup_request = Signal(object)
-
-    def __init__(self, snaked_conf):
-        self.uri = None
-        self.session = None
-        self.saveable = True
-        self.lang = None
-        self.contexts = []
-        self.prefs = {}
-
+    def __init__(self, conf, buf=None):
         self.last_cursor_move = None
 
         sw = gtk.ScrolledWindow()
         sw.set_policy(gtk.POLICY_AUTOMATIC, gtk.POLICY_ALWAYS)
 
-        self.buffer = gtksourceview2.Buffer()
+        self.buffer = buf or gtksourceview2.Buffer()
 
         self.view = gtksourceview2.View()
         self.view.set_buffer(self.buffer)
         sw.add(self.view)
         self.view.editor_ref = weakref.ref(self)
+
+        self.ins_mark = self.sb_mark = None
+        self.view.connect('focus-in-event', self.on_focus_in)
+        self.view.connect('focus-out-event', self.on_focus_out)
 
         self.widget = gtk.VBox(False, 0)
         self.widget.pack_start(sw)
@@ -64,10 +48,14 @@ class Editor(SignalManager):
 
         connect_all(self, buffer=self.buffer, view=self.view)
 
-        if snaked_conf['DISABLE_LEFT_CLICK']:
-            self.view.connect('button-press-event', self.on_button_press_event)
+        if conf['DISABLE_LEFT_CLICK']:
+            weak_connect(self.view, 'button-press-event', self, 'on_button_press_event')
 
-        self.snaked_conf = snaked_conf
+        self.conf = conf
+
+        if buf:
+            idle(self.update_view_preferences)
+            idle(self.update_title)
 
     def update_title(self):
         if self.uri:
@@ -78,11 +66,24 @@ class Editor(SignalManager):
         else:
             title = 'Unknown'
 
-        self.change_title.emit(title)
+        self.window.set_editor_title(self, title)
+
+    @property
+    def uri(self):
+        return self.buffer.uri
+
+    @property
+    def encoding(self):
+        return self.buffer.encoding
+
+    @property
+    def session(self):
+        return self.buffer.session
 
     def load_file(self, filename, line=None):
-        self.uri = os.path.abspath(filename)
-        self.encoding = 'utf-8'
+        self.buffer.uri = os.path.abspath(filename)
+        self.buffer.encoding = 'utf-8'
+        self.buffer.saveable = True
 
         if os.path.exists(self.uri):
             self.view.window.freeze_updates()
@@ -99,16 +100,17 @@ class Editor(SignalManager):
                     result = chardet.detect(text)
                     if result['encoding']:
                         utext = text.decode(result['encoding'])
-                        self.encoding = result['encoding']
-                        idle(self.message, 'Automatically selected ' + self.encoding + 'encoding', 5000)
+                        self.buffer.encoding = result['encoding']
+                        idle(self.message,
+                            'Automatically selected ' + self.buffer.encoding + 'encoding', 'info', 5000)
                     else:
-                        self.saveable = False
+                        self.buffer.saveable = False
                         utext = 'Is this a text file?'
                 except ImportError:
-                    self.saveable = False
+                    self.buffer.saveable = False
                     utext = str(e)
                 except UnicodeDecodeError, ee:
-                    self.saveable = False
+                    self.buffer.saveable = False
                     utext = str(ee)
 
             self.buffer.set_text(utext)
@@ -116,16 +118,17 @@ class Editor(SignalManager):
 
             self.buffer.end_not_undoable_action()
 
-            if 'MODIFIED_FILES' in self.snaked_conf and self.uri in self.snaked_conf['MODIFIED_FILES']:
-                tmpfilename = self.snaked_conf['MODIFIED_FILES'][self.uri]
+            if self.uri in self.conf['MODIFIED_FILES']:
+                tmpfilename = self.conf['MODIFIED_FILES'][self.uri]
                 if os.path.exists(tmpfilename):
                     self.buffer.begin_user_action()
-                    utext = open(tmpfilename).read().decode(self.encoding)
+                    utext = open(tmpfilename).read().decode(self.buffer.encoding)
                     self.buffer.set_text(utext)
                     self.buffer.end_user_action()
 
             self.on_modified_changed_handler.unblock()
             self.view.window.thaw_updates()
+            self.buffer.is_changed = False
 
             pos = line if line is not None else self.get_file_position.emit()
             if pos is not None and pos >= 0:
@@ -143,26 +146,28 @@ class Editor(SignalManager):
         self.update_title()
 
     def save(self):
-        if not self.saveable:
-            self.message("This file was opened with error and can't be saved")
+        if not self.buffer.saveable:
+            self.message("This file was opened with error and can't be saved", 'warn')
             return
 
         if self.uri:
             if self.before_file_save.emit():
                 return
 
-            if self.prefs['remove-trailing-space']:
+            if self.buffer.config['remove-trailing-space']:
                 from snaked.core.processors import remove_trailing_spaces
                 remove_trailing_spaces(self.buffer)
 
+            # TODO quick hack to ignore file changes by snaked itself
             try:
                 save_file(self.uri, self.utext, self.encoding)
+                self.buffer.monitor.saved_by_snaked = True
                 if not self.buffer.get_modified():
-                    self.message("%s saved" % self.uri)
+                    self.message("%s saved" % self.uri, 'done')
                 self.buffer.set_modified(False)
                 self.file_saved.emit()
             except Exception, e:
-                self.message(str(e), 5000)
+                self.message(str(e), 'error', 5000)
 
     @property
     def project_root(self):
@@ -188,10 +193,6 @@ class Editor(SignalManager):
                 root = os.path.dirname(self.uri)
 
         return root
-
-    def open_file(self, filename, line=None, lang_id=None):
-        """:rtype: Editor"""
-        return self.request_to_open_file.emit(filename, line, lang_id)
 
     @property
     def cursor(self):
@@ -239,6 +240,15 @@ class Editor(SignalManager):
         """
         return unicode(self.text, 'utf-8')
 
+    def clear_cursor(self):
+        if self.ins_mark:
+            self.buffer.delete_mark(self.ins_mark)
+            self.ins_mark = None
+
+        if self.sb_mark:
+            self.buffer.delete_mark(self.sb_mark)
+            self.sb_mark = None
+
     def goto_line(self, line, minimal=False):
         iterator = self.buffer.get_iter_at_line(line - 1)
         self.buffer.place_cursor(iterator)
@@ -247,39 +257,17 @@ class Editor(SignalManager):
         else:
             self.view.scroll_to_mark(self.buffer.get_insert(), 0.001, use_align=True, xalign=1.0)
 
+        self.clear_cursor()
+
     def scroll_to_cursor(self):
         self.view.scroll_to_mark(self.buffer.get_insert(), 0.001, use_align=True, xalign=1.0)
+        self.clear_cursor()
 
-    @single_ref
-    def feedback_popup(self):
-        from .feedback import FeedbackPopup
-        return FeedbackPopup()
-
-    def message(self, message, timeout=1500, markup=False):
-        popup = self.feedback_popup
-        popup.show(self, message, timeout, markup)
-        self.push_escape(popup.hide, popup.escape)
-
-    def push_escape(self, callback, *args):
-        self.push_escape_callback.emit(callback, args)
+    def message(self, message, category=None, timeout=None, markup=False):
+        return self.window.message(message, category, timeout, markup=markup, parent=self.view)
 
     def add_spot(self):
-        self.add_spot_request.emit()
-
-    @connect_external('view', 'move-cursor')
-    def on_cursor_moved(self, view, step_size, count, extend_selection):
-        if not extend_selection:
-            if step_size in (gtk.MOVEMENT_PAGES, gtk.MOVEMENT_BUFFER_ENDS):
-                if self.last_cursor_move is None or time.time() - self.last_cursor_move > 7:
-                    self.add_spot()
-
-                self.last_cursor_move = time.time()
-            elif step_size in (gtk.MOVEMENT_VISUAL_POSITIONS, ):
-                self.last_cursor_move = None
-
-    @connect_external('buffer', 'changed')
-    def on_buffer_changed(self, buffer):
-        self.last_cursor_move = None
+        self.window.manager.spot_manager.add(self)
 
     def on_button_press_event(self, view, event):
         if event.button == 1:
@@ -287,21 +275,51 @@ class Editor(SignalManager):
 
         return False
 
-    def add_widget_to_stack(self, widget, on_popup=None):
-        self.stack_add_request.emit(widget, on_popup)
-
-    def popup_widget(self, widget):
-        self.stack_popup_request.emit(widget)
-
     def on_close(self):
-        if self.buffer.get_modified():
-            if 'MODIFIED_FILES' not in self.snaked_conf:
-                self.snaked_conf['MODIFIED_FILES'] = {}
+        self.view.destroy()
 
-            self.snaked_conf['MODIFIED_FILES'][self.uri] = save_file(self.uri, self.utext,
-                self.encoding, True)
+    def update_view_preferences(self):
+        update_view_preferences(self.view, self.buffer)
+
+    @property
+    def window(self):
+        return self.view.get_toplevel()
+
+    def close(self):
+        self.window.close_editor(self)
+
+    def focus(self):
+        w = self.window
+        w.focus_editor(self)
+        w.present()
+
+    @property
+    def lang(self):
+        return self.buffer.lang
+
+    @property
+    def contexts(self):
+        return self.buffer.contexts
+
+    def on_focus_in(self, view, event):
+        if self.ins_mark:
+            buf = self.buffer
+            buf.select_range(buf.get_iter_at_mark(self.ins_mark),
+                buf.get_iter_at_mark(self.sb_mark))
+
+        return False
+
+    def on_focus_out(self, view, event):
+        buf = self.buffer
+        ins = buf.get_iter_at_mark(buf.get_insert())
+        sb = buf.get_iter_at_mark(buf.get_selection_bound())
+
+        if self.ins_mark:
+            buf.move_mark(self.ins_mark, ins)
         else:
-            try:
-                del self.snaked_conf['MODIFIED_FILES'][self.uri]
-            except KeyError:
-                pass
+            self.ins_mark = buf.create_mark(None, ins)
+
+        if self.sb_mark:
+            buf.move_mark(self.sb_mark, sb)
+        else:
+            self.sb_mark = buf.create_mark(None, sb)

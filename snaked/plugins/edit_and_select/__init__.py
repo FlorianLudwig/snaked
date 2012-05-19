@@ -1,34 +1,55 @@
-eauthor = 'Anton Bobrov<bobrov@vl.ru>'
+author = 'Anton Bobrov<bobrov@vl.ru>'
 name = 'Edit and Select'
 desc = 'Various edit shortcuts'
 
 import weakref
 import gtk
+from uxie.floating import TextFeedback
 
 last_smart_selections = weakref.WeakKeyDictionary()
 
-def init(manager):
-    manager.add_shortcut('delete-line', '<ctrl>d', 'Edit', 'Deletes current line', delete_line)
-    manager.add_shortcut('smart-select', '<alt>w', 'Selection', 'Smart anything selection', smart_select)
-    manager.add_shortcut('smart-unselect', '<shift><alt>w',
-        'Selection', 'Back smart selection', smart_unselect)
-    manager.add_shortcut('show_offset', '<ctrl><alt>o', 'Edit',
-        'Show cursor offset and column', show_offset)
-    manager.add_shortcut('wrap-text', '<alt>f', 'Edit', 'Wrap text on right margin width', wrap_text)
+def init(injector):
+    injector.add_context('editor-with-cursor-in-string', 'editor', in_string)
 
-    manager.add_global_option('DOUBLE_BRACKET_MATCHER', True, "Enable custom bracket matcher")
-    manager.add_global_option('COPY_DELETED_LINE', True, "Put deleted line into clipboard")
+    injector.bind('editor-active', 'delete-line', 'Edit/_Delete line#20', delete_line).to('<ctrl>d')
+
+    injector.bind('editor-active', 'smart-select', 'Edit/Smart _select', smart_select).to('<alt>w')
+    injector.bind('editor-with-selection', 'smart-unselect', 'Edit/Smart _unselect',
+        smart_unselect).to('<shift><alt>w')
+
+    injector.bind_check('editor-active', 'show_offset', 'Tools/Show offset and column#10',
+        toggle_offset).to('<ctrl><alt>o')
+
+    injector.bind('editor-with-selection', 'wrap-text', 'Edit/_Wrap block', wrap_text).to('<alt>f')
+
+    injector.bind('editor-with-selection', 'move-selection-left',
+        'Edit/Move selection _left', move_word_left).to('<alt>Left')
+    injector.bind('editor-with-selection', 'move-selection-right',
+        'Edit/Move selection _right', move_word_right).to('<alt>Right')
+
+    injector.bind('editor-with-cursor-in-string', 'swap-quotes',
+        'Edit/Swap _quotes', swap_quotes).to('<alt>apostrophe')
+
+    from snaked.core.prefs import add_option
+    add_option('DOUBLE_BRACKET_MATCHER', True, "Enable custom bracket matcher")
+    add_option('COPY_DELETED_LINE', True, "Put deleted line into clipboard")
+
+    injector.on_ready('editor-with-new-buffer', editor_created)
 
 def editor_created(editor):
-    if editor.snaked_conf['DOUBLE_BRACKET_MATCHER']:
+    if editor.conf['DOUBLE_BRACKET_MATCHER']:
         from bracket_matcher import attach
         attach(editor)
+
+def in_string(editor):
+    from .util import cursor_in_string
+    return editor if cursor_in_string(editor.cursor) else None
 
 def delete_line(editor):
     from util import get_line_bounds, line_is_empty
 
     bounds = get_line_bounds(editor.cursor)
-    if not line_is_empty(editor.cursor) and editor.snaked_conf['COPY_DELETED_LINE']:
+    if not line_is_empty(editor.cursor) and editor.conf['COPY_DELETED_LINE']:
         clipboard = editor.view.get_clipboard(gtk.gdk.SELECTION_CLIPBOARD)
         editor.buffer.select_range(*bounds)
         editor.buffer.copy_clipboard(clipboard)
@@ -59,8 +80,7 @@ def smart_select(editor):
     editor.buffer.select_range(end, start)
 
 def smart_unselect(editor):
-    if not editor.buffer.get_has_selection() or editor not in last_smart_selections \
-            or not last_smart_selections[editor]:
+    if editor not in last_smart_selections or not last_smart_selections[editor]:
         editor.message('Unselect what?')
         return
 
@@ -73,16 +93,41 @@ def smart_unselect(editor):
         last_smart_selections[editor][:] = []
         editor.message('Nothing to unselect')
 
-def show_offset(editor):
-    editor.message('offset: %d\ncolumn: %d' % (
-        editor.cursor.get_offset(), editor.cursor.get_line_offset()), 3000)
+offset_feedbacks = weakref.WeakKeyDictionary()
+def get_offset_message(editor):
+    cursor = editor.cursor
+    return 'offset: %d\ncolumn: %d' % (cursor.get_offset(), cursor.get_line_offset())
+
+def on_buffer_cursor_changed(_buf, _prop, editor_ref):
+    editor = editor_ref()
+    offset_feedbacks[editor].label.set_text(get_offset_message(editor))
+
+def toggle_offset(editor, is_set):
+    if is_set:
+        if editor in offset_feedbacks:
+            offset_feedbacks[editor].cancel()
+        else:
+            feedback = offset_feedbacks[editor] = editor.window.floating_manager.add(editor.view,
+                TextFeedback(get_offset_message(editor), 'info'), 10)
+
+            editor.window.push_escape(feedback, 10)
+
+            editor_ref = weakref.ref(editor)
+            hid = editor.buffer.connect_after('notify::cursor-position', on_buffer_cursor_changed,
+                editor_ref)
+
+            def on_cancel(_feedback):
+                editor = editor_ref()
+                if editor:
+                    offset_feedbacks.pop(editor, None)
+                    editor.buffer.handler_disconnect(hid)
+
+            feedback.on_cancel(on_cancel)
+    else:
+        return editor in offset_feedbacks
 
 def wrap_text(editor):
     buf = editor.buffer
-    if not buf.get_has_selection():
-        editor.message('Select text block to wrap')
-        return
-
     import textwrap, re
     from util import get_whitespace
 
@@ -105,4 +150,71 @@ def wrap_text(editor):
     buf.place_cursor(end)
     buf.delete(start, end)
     buf.insert_at_cursor(text)
+    buf.end_user_action()
+
+def move_word(buf, fromiter, tomark):
+    toiter = fromiter.copy()
+    toiter.forward_char()
+
+    text = fromiter.get_text(toiter)
+
+    buf.begin_user_action()
+    buf.delete(fromiter, toiter)
+    buf.insert(buf.get_iter_at_mark(tomark), text)
+    buf.end_user_action()
+
+def move_word_left(editor):
+    buf = editor.buffer
+    start, end = map(gtk.TextIter.copy, buf.get_selection_bounds())
+    start.order(end)
+
+    if not start.backward_char():
+        editor.message('You are already at begin of file')
+        return
+
+    move_word(buf, start, buf.create_mark(None, end))
+
+    start, end = buf.get_selection_bounds()
+    start.order(end)
+    end.backward_char()
+    buf.select_range(start, end)
+
+def move_word_right(editor):
+    buf = editor.buffer
+    start, end = map(gtk.TextIter.copy, buf.get_selection_bounds())
+    start.order(end)
+
+    if end.is_end():
+        editor.message('You are already at end of file')
+        return
+
+    move_word(buf, end, buf.create_mark(None, start))
+
+def swap_quotes(editor):
+    from .util import source_view_pairs_parser
+    start, end = source_view_pairs_parser(editor.cursor)
+
+    buf = editor.buffer
+    text = buf.get_text(start, end).decode('utf-8')
+
+    q = text[0]
+    if q == '"':
+        aq = "'"
+    elif q == "'":
+        aq = '"'
+    else:
+        editor.message('Swap quote? What quote?', 'warn')
+        return
+
+    if text[-1] == q:
+        text = aq + text[1:-1].replace(aq, '\\' + aq).replace('\\' + q, q) + aq
+    else:
+        editor.message('Swap quote? What quote?', 'warn')
+        return
+
+    offset = editor.cursor.get_offset()
+    buf.begin_user_action()
+    buf.delete(start, end)
+    buf.insert_at_cursor(text)
+    buf.place_cursor(buf.get_iter_at_offset(offset))
     buf.end_user_action()

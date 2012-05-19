@@ -1,6 +1,7 @@
+import sys
 import time
 
-from snaked.util import join_to_file_dir
+from uxie.utils import join_to_file_dir
 from snaked.plugins.python.pytest_launcher import run_test
 
 def collect_results(proc, conn):
@@ -53,7 +54,13 @@ def test_runner_must_return_runned_test_results():
     assert 'AttributeError' in result[9][2]
 
 def test_runner_must_ignore_skipped_collected_items():
-    result = collect_results(*run_test(join_to_file_dir(__file__),
+    result = collect_results(*run_test(join_to_file_dir(__file__), None,
         'test_first', files=['python_test/first.py']))
 
     assert result[1] == ('COLLECTED_TESTS', ['python_test/first.py::test_first'])
+
+def test_runner_must_return_output_of_failed_tests():
+    result = collect_results(*run_test(join_to_file_dir(__file__), files=['python_test/first.py'],
+        match='test_second'))
+
+    assert 'test-second-output' in result[3][2]

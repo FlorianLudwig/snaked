@@ -1,12 +1,13 @@
 import os.path
-import os
 import weakref
 
 import gtk
 
-from snaked.util import (idle, join_to_file_dir, BuilderAware, open_mime, refresh_gui,
-    set_activate_the_one_item)
-from snaked.core.shortcuts import ShortcutActivator
+from uxie.utils import idle, join_to_file_dir, refresh_gui
+from uxie.misc import BuilderAware
+from uxie.actions import Activator
+
+from snaked.util import set_activate_the_one_item
 
 import settings
 import searcher
@@ -16,31 +17,80 @@ class QuickOpenDialog(BuilderAware):
 
     def __init__(self):
         super(QuickOpenDialog, self).__init__(join_to_file_dir(__file__, 'gui.glade'))
-        self.shortcuts = ShortcutActivator(self.window)
-        self.shortcuts.bind('Escape', self.escape)
-        self.shortcuts.bind('<alt>Up', self.project_up)
-        self.shortcuts.bind('<alt>Down', self.project_down)
-        self.shortcuts.bind('<ctrl>Return', self.open_mime)
-        self.shortcuts.bind('<alt>s', self.focus_search)
-        self.shortcuts.bind('<ctrl>o', self.free_open)
-        self.shortcuts.bind('<ctrl>p', self.popup_projects)
-        self.shortcuts.bind('<ctrl>Delete', self.delete_project)
-        self.shortcuts.bind('<ctrl>h', self.toggle_hidden)
-        self.shortcuts.bind('BackSpace', self.browse_top)
+
+        from snaked.core.manager import keymap
+        self.shortcuts = keymap.get_activator(self.window, 'quick_open')
+        self.shortcuts.bind('any', 'activate-search-entry',
+            'Activate search entry', self.focus_search)
+
+        self.shortcuts.bind('any', 'open-mime', 'Run _external editor',
+            self.open_mime).to('<ctrl>Return')
+        self.shortcuts.bind('any', 'open-dialog', '_Open...', self.free_open).to('<ctrl>o')
+        self.shortcuts.bind('any', 'toggle-hidden', 'Toggle _hidden',
+            self.toggle_hidden).to('<ctrl>h')
+
+        self.shortcuts.bind('any', 'project-list', 'Toggle project _list',
+            self.toggle_projects).to('<ctrl>p', 1)
+        self.shortcuts.bind('projectlist', 'delete', '_Delete project', self.delete_project)
+        self.shortcuts.bind('projectlist', 'set-root', 'Use as _root',
+            self.use_as_root).to('Return', 1)
+
+        self.shortcuts.bind('any', 'goto-parent', 'Goto p_arent', self.browse_top).to('BackSpace')
+        self.shortcuts.bind('any', 'escape', '_Close', self.escape)
+
+        self.shortcuts.add_context('projectlist', (),
+            lambda: self.projectlist_tree if self.projectlist_tree.is_focus() else None)
+
+        project_selection = self.projectlist_tree.get_selection()
+        project_selection.set_mode(gtk.SELECTION_MULTIPLE)
+        project_selection.connect_after('changed', self.on_projectlist_selection_changed)
 
         set_activate_the_one_item(self.search_entry, self.filelist_tree)
 
+        self.roots = []
+
     def get_stored_recent_projects(self):
-        return self.editor().snaked_conf['QUICK_OPEN_RECENT_PROJECTS']
+        return self.pwindow().manager.conf['QUICK_OPEN_RECENT_PROJECTS']
 
     def store_recent_projects(self, projects):
-        self.editor().snaked_conf['QUICK_OPEN_RECENT_PROJECTS'] = list(projects)
+        self.pwindow().manager.conf['QUICK_OPEN_RECENT_PROJECTS'][:] = list(projects)
 
-    def show(self, editor):
-        self.editor = weakref.ref(editor)
+    def get_editor_project_root(self):
+        editor = self.pwindow().get_editor_context()
+        return editor.project_root if editor else None
+
+    def get_selected_projects(self):
+        cur_projects = self.pwindow().manager.conf['QUICK_OPEN_CURRENT_PROJECTS']
+        if not cur_projects:
+            editor = self.pwindow().get_editor_context()
+            if editor:
+                cur_projects = [editor.get_project_root(larva=True)]
+            else:
+                cur_projects = [os.getcwd()]
+
+        return cur_projects
+
+    def on_projectlist_selection_changed(self, selection):
+        model, paths = selection.get_selected_rows()
+        self.pwindow().manager.conf['QUICK_OPEN_CURRENT_PROJECTS'][:] = [model[r][1] for r in paths]
+        self.update_projects(self.get_selected_projects())
+
+    def use_as_root(self, pl):
+        cursor, _ = pl.get_cursor()
+        if cursor:
+            self.update_projects([pl.get_model()[cursor][1]])
+        else:
+            self.pwindow().emessage('Which project?', 'warn')
+
+    def show(self, window, on_dialog_escape=None):
+        self.on_dialog_escape = on_dialog_escape
+        self.pwindow = weakref.ref(window)
         self.update_recent_projects()
-        self.update_projects(editor.get_project_root(larva=True))
-        editor.request_transient_for.emit(self.window)
+
+        editor = window.get_editor_context()
+        if editor:
+            self.update_projects(self.get_selected_projects())
+        self.window.set_transient_for(window)
 
         self.search_entry.grab_focus()
 
@@ -60,35 +110,38 @@ class QuickOpenDialog(BuilderAware):
             [settings.recent_projects.append(p) for p in saved_projects
                 if p not in settings.recent_projects]
 
-    def update_projects(self, root):
-        old_root = self.get_current_root()
-
-        self.projects_cbox.handler_block_by_func(self.on_projects_cbox_changed)
-
-        self.projects_cbox.set_model(None)
+        sel = self.projectlist_tree.get_selection()
+        sel.handler_block_by_func(self.on_projectlist_selection_changed)
+        self.projectlist_tree.set_model(None)
         self.projectlist.clear()
 
-        index = 0
+        cur_projects = self.pwindow().manager.conf['QUICK_OPEN_CURRENT_PROJECTS']
+
+        toselect = []
         for i, r in enumerate(settings.recent_projects):
-            if r == root:
-                index = i
-            self.projectlist.append((r,))
+            it = self.projectlist.append((os.path.basename(r), r))
+            if r in cur_projects:
+                toselect.append(it)
 
         for i, r in enumerate(reversed(sorted(settings.larva_projects, key=lambda r:len(r)))):
-            if r == root:
-                index = i + len(settings.recent_projects)
-            self.projectlist.append((r,))
+            it = self.projectlist.append((os.path.basename(r), r))
+            if r in cur_projects:
+                toselect.append(it)
 
-        if not len(self.projectlist):
-            self.projectlist.append((os.getcwd(),))
+        self.projectlist_tree.set_model(self.projectlist)
 
-        self.projects_cbox.set_model(self.projectlist)
-        self.projects_cbox.set_active(index)
+        for it in toselect:
+            self.projectlist_tree.get_selection().select_iter(it)
 
-        self.projects_cbox.handler_unblock_by_func(self.on_projects_cbox_changed)
+        sel.handler_unblock_by_func(self.on_projectlist_selection_changed)
 
-        if self.get_current_root() != old_root:
+    def update_projects(self, roots):
+        self.projects_lb.set_text('\n'.join(roots))
+
+        if self.roots != roots:
             self.on_search_entry_changed()
+
+        self.roots[:] = roots
 
     def hide(self):
         self.current_search = None
@@ -97,26 +150,6 @@ class QuickOpenDialog(BuilderAware):
     def on_delete_event(self, *args):
         self.escape()
         return True
-
-    def project_up(self):
-        idx = self.projects_cbox.get_active()
-        idx = ( idx - 1 ) % len(self.projectlist)
-        self.projects_cbox.set_active(idx)
-
-    def project_down(self):
-        idx = self.projects_cbox.get_active()
-        idx = ( idx + 1 ) % len(self.projectlist)
-        self.projects_cbox.set_active(idx)
-
-    def get_current_root(self):
-        try:
-            idx = self.projects_cbox.get_active()
-            if idx >=0:
-                return self.projectlist[idx][0]
-        except IndexError:
-            pass
-
-        return None
 
     def fill_filelist(self, search, current_search):
         self.filelist.clear()
@@ -131,67 +164,65 @@ class QuickOpenDialog(BuilderAware):
                 if self.current_search is not current_search:
                     raise StopIteration()
 
-        root = self.get_current_root()
-
-        try:
-            bad_re = settings.ignore_contexts[root]['ignore']
-            def bad_matcher(path):
-                return bad_re.search(path)
-
-        except KeyError:
-            bad_matcher = None
+        bad_matchers = {}
+        for r in self.roots:
+            try:
+                bad_re = self.pwindow().manager.get_context_manager(r).get()['quick_open']['ignore']
+            except KeyError:
+                bad_matchers[r] = None
+            else:
+                bad_matchers[r] = lambda path, bre=bad_re: bre.search(path)
 
         for m in (searcher.name_start_match, searcher.name_match,
                 searcher.path_match, searcher.fuzzy_match):
-            for p in searcher.search(root, '', m(search), already_matched, bad_matcher, tick):
-                if self.current_search is not current_search:
-                    return
+            for root in self.roots:
+                for p in searcher.search(os.path.dirname(root), os.path.basename(root),
+                        m(search), already_matched, bad_matchers[root], tick):
+                    if self.current_search is not current_search:
+                        return
 
-                already_matched[p] = True
-                self.filelist.append(p)
+                    already_matched[p] = True
+                    self.filelist.append(p)
 
-                if len(self.filelist) > 150:
-                    self.filelist_tree.columns_autosize()
-                    return
+                    if len(self.filelist) > 150:
+                        self.filelist_tree.columns_autosize()
+                        return
 
         self.filelist_tree.columns_autosize()
 
-    def fill_with_dirs(self, top='', place=False):
+    def fill_with_dirs(self, root='', top='', place=False):
         self.filelist.clear()
 
         dirs = []
         files = []
 
-        conf = self.editor().snaked_conf
+        conf = self.pwindow().manager.conf
         hidden_masks = None
         if not conf['QUICK_OPEN_SHOW_HIDDEN']:
             hidden_masks = conf['QUICK_OPEN_HIDDEN_FILES']
 
-        if top and not top.endswith('/'):
-            top += '/'
+        if not top and len(self.roots) > 1:
+            for r in self.roots:
+                dirs.append((os.path.basename(r), r, os.path.dirname(r), ''))
+        else:
+            if not top:
+                root = self.roots[0]
 
-        root = os.path.join(self.get_current_root(), top)
-        for name in os.listdir(root):
-            if hidden_masks and any(name.endswith(m) for m in hidden_masks):
-                continue
+            for name in os.listdir(os.path.join(root, top)):
+                if hidden_masks and any(name.endswith(m) for m in hidden_masks):
+                    continue
 
-            path = os.path.join(root, name)
-            if os.path.isdir(path):
-                dirs.append(name+'/')
-            else:
-                files.append(name)
+                fpath = os.path.join(root, top, name)
+                if os.path.isdir(fpath):
+                    dirs.append((name, fpath, root, top))
+                else:
+                    files.append((name, fpath, root, top))
 
         place_idx = 0
-        for i, name in enumerate(sorted(dirs)):
+        for i, (name, fpath, root, top) in enumerate(sorted(dirs) + sorted(files)):
             if name == place:
                 place_idx = i
-            self.filelist.append((name, top))
-
-        for i, name in enumerate(sorted(files)):
-            if name == place:
-                place_idx = i + len(dirs)
-            self.filelist.append((name, top))
-
+            self.filelist.append((name, top, fpath, root))
         self.filelist_tree.columns_autosize()
 
         if place and len(self.filelist):
@@ -205,40 +236,47 @@ class QuickOpenDialog(BuilderAware):
         else:
             idle(self.fill_with_dirs)
 
-    def on_projects_cbox_changed(self, *args):
-        self.on_search_entry_changed()
-
     def get_selected_file(self):
         (model, iter) = self.filelist_tree.get_selection().get_selected()
         if iter:
-            name, top = self.filelist.get(iter, 0, 1)
-            return os.path.join(self.get_current_root(), top, name), name, top
+            name, top, path, root = self.filelist.get(iter, 0, 1, 2, 3)
+            return path, name, root, top
         else:
-            return None, None, None
+            return None, None, None, None
 
     def open_file(self, *args):
-        fname, name, top = self.get_selected_file()
+        fname, name, root, top = self.get_selected_file()
         if fname:
             if os.path.isdir(fname):
-                idle(self.fill_with_dirs, os.path.join(top, name), True)
+                idle(self.fill_with_dirs, root, os.path.join(top, name), True)
             else:
                 self.hide()
                 refresh_gui()
-                self.editor().open_file(fname)
+                self.pwindow().open_or_activate(fname)
 
     def open_mime(self):
-        fname, name, top = self.get_selected_file()
+        fname, name, root, top = self.get_selected_file()
         if fname:
+            import gio
             self.hide()
             refresh_gui()
-            open_mime(fname)
+
+            f = gio.file_parse_name(fname)
+            ct = f.query_info(gio.FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE).get_content_type()
+            ai = gio.app_info_get_default_for_type(ct, False)
+
+            if ai:
+                ai.launch([f])
+            else:
+                self.pwindow().emessage('Unknown content type for launch %s' % ct, 'error')
 
     def focus_search(self):
         self.search_entry.grab_focus()
 
     def escape(self):
-        if hasattr(self.editor(), 'on_dialog_escape'):
-            idle(self.editor().on_dialog_escape, self)
+        if self.on_dialog_escape:
+            idle(self.on_dialog_escape, self)
+
         self.hide()
 
     def free_open(self):
@@ -249,62 +287,73 @@ class QuickOpenDialog(BuilderAware):
             gtk.STOCK_OPEN, gtk.RESPONSE_OK))
 
         dialog.set_default_response(gtk.RESPONSE_OK)
+        dialog.set_current_folder(self.roots[0])
 
         response = dialog.run()
         if response == gtk.RESPONSE_OK:
-            idle(self.editor().open_file, dialog.get_filename())
+            idle(self.pwindow().open_or_activate, dialog.get_filename())
             idle(self.hide)
 
         dialog.destroy()
 
-    def popup_projects(self):
-        self.projects_cbox.popup()
+    def toggle_projects(self):
+        if not self.scrolledwindow2.get_visible():
+            self.scrolledwindow2.show()
 
-    def delete_project(self):
+        if self.projectlist_tree.is_focus():
+            self.scrolledwindow2.hide()
+            self.window.resize(self.window.size_request()[0], self.window.get_size()[1])
+            getattr(self, 'last_focus', self.search_entry).grab_focus()
+        else:
+            self.last_focus = self.window.get_focus()
+            self.projectlist_tree.grab_focus()
+
+    def delete_project(self, pl):
         if len(self.projectlist):
-            current_root = self.get_current_root()
-            if current_root == self.editor().project_root:
-                self.editor().message('You can not remove current project')
-                return
-            settings.recent_projects.remove(current_root)
-            self.store_recent_projects(settings.recent_projects)
+            cursor, _ = pl.get_cursor()
+            if cursor:
+                current_root = self.projectlist[cursor][1]
+                if current_root in self.roots:
+                    self.pwindow().emessage('You can not remove current project', 'warn')
+                    return
 
-            idx = self.projects_cbox.get_active()
-            self.projectlist.remove(self.projects_cbox.get_active_iter())
-            self.projects_cbox.set_active(idx % len(self.projectlist))
-            self.editor().message('Project removed')
+                settings.recent_projects.remove(current_root)
+                self.store_recent_projects(settings.recent_projects)
+
+                self.projectlist.remove(self.projectlist[cursor].iter)
+                self.pwindow().emessage('Project removed', 'done')
 
     def browse_top(self):
         if not self.filelist_tree.is_focus():
             return False
 
         if self.search_entry.get_text():
-            self.editor().message('You are not in browse mode')
+            self.pwindow().emessage('You are not in browse mode', 'warn')
             return
 
-        fname, name, top = self.get_selected_file()
+        fname, name, root, top = self.get_selected_file()
         if fname:
             if not top:
-                self.editor().message('No way!')
+                self.pwindow().emessage('No way!', 'warn')
             else:
-                place = os.path.basename(os.path.dirname(top)) + '/'
-                idle(self.fill_with_dirs, os.path.dirname(os.path.dirname(top)), place)
+                place = os.path.basename(top)
+                idle(self.fill_with_dirs, root, os.path.dirname(top), place)
 
     def toggle_hidden(self):
         if self.search_entry.get_text():
-            self.editor().message('You are not in browse mode')
+            self.pwindow().emessage('You are not in browse mode', 'warn')
             return
 
-        conf = self.editor().snaked_conf
+        conf = self.pwindow().manager.conf
         conf['QUICK_OPEN_SHOW_HIDDEN'] = not conf['QUICK_OPEN_SHOW_HIDDEN']
 
-        self.editor().message('Show hidden files' if conf['QUICK_OPEN_SHOW_HIDDEN'] else
-            'Do not show hidden files' )
+        self.pwindow().emessage('Show hidden files' if conf['QUICK_OPEN_SHOW_HIDDEN']
+            else 'Do not show hidden files', 'info')
 
-        fname, name, top = self.get_selected_file()
+        fname, name, root, top = self.get_selected_file()
         if fname:
-            idle(self.fill_with_dirs, top, name)
+            idle(self.fill_with_dirs, root, top, name)
         else:
             if len(self.filelist):
                 name, top = self.filelist[0]
-                idle(self.fill_with_dirs, top)
+                idle(self.fill_with_dirs, root, top)
